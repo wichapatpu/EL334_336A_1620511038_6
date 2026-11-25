@@ -1,0 +1,401 @@
+#include "MK64F12.h"
+
+#define CLOCK  20971520
+#define BAUD   115200
+
+#define COUNTDOWN  0
+#define STOPWATCH  1
+
+#define READY  0
+#define RUN    1
+#define PAUSE  2
+#define STOP   3
+#define DONE   4
+
+#define SW1  3
+#define SW2  10
+#define SW3  11
+
+unsigned char number[10] = {0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90};
+
+unsigned char digit_select[4] = {0xF1, 0xF2, 0xF4, 0xF8};
+
+volatile unsigned char show[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+
+volatile int mode = COUNTDOWN;
+
+volatile int cd_state = READY;
+volatile int cd_time = 60;
+int set_time = 60;
+int done_printed = 0;
+
+volatile int sw_state = READY;
+volatile int sw_time = 0;
+
+volatile int ms = 0;
+volatile int one_sec = 0;
+
+volatile int sw1_press = 0;
+volatile int sw2_press = 0;
+volatile int sw3_press = 0;
+
+void led_init(void)
+{
+    SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK | SIM_SCGC5_PORTD_MASK;
+
+    PORTD->PCR[0] = PORT_PCR_MUX(1);
+    PORTD->PCR[1] = PORT_PCR_MUX(1);
+    PORTD->PCR[2] = PORT_PCR_MUX(1);
+    PORTD->PCR[3] = PORT_PCR_MUX(1);
+    PTD->PSOR = 0x0F;
+    PTD->PDDR |= 0x0F;
+
+    PORTA->PCR[1] = PORT_PCR_MUX(1);
+    PTA->PSOR = (1 << 1);
+    PTA->PDDR |= (1 << 1);
+}
+
+void led_only(int n)
+{
+    PTD->PSOR = 0x0F;
+    if (n == 1) PTD->PCOR = (1 << 1);
+    if (n == 2) PTD->PCOR = (1 << 3);
+    if (n == 3) PTD->PCOR = (1 << 2);
+}
+
+void buzzer(int on)
+{
+    if (on == 1) PTA->PCOR = (1 << 1);
+    else         PTA->PSOR = (1 << 1);
+}
+
+void switch_init(void)
+{
+    SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK;
+
+    PORTB->PCR[SW1] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK | PORT_PCR_IRQC(10);
+    PORTB->PCR[SW2] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK | PORT_PCR_IRQC(10);
+    PORTB->PCR[SW3] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK | PORT_PCR_IRQC(10);
+    PTB->PDDR &= ~((1 << SW1) | (1 << SW2) | (1 << SW3));
+
+    PORTB->ISFR = 0xFFFFFFFF;
+    NVIC->ISER[1] = (1 << 28); /* Interrupt */
+}
+
+void PORTB_IRQHandler(void)
+{
+    if (PORTB->ISFR & (1 << SW1)) sw1_press = 1;
+    if (PORTB->ISFR & (1 << SW2)) sw2_press = 1;
+    if (PORTB->ISFR & (1 << SW3)) sw3_press = 1;
+    PORTB->ISFR = 0xFFFFFFFF;
+}
+
+void wait_release(int pin)
+{
+    int start;
+    while ((PTB->PDIR & (1 << pin)) == 0) { }
+    start = ms;
+    while (ms - start < 50) { }
+}
+
+void seg_init(void)
+{
+    SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK | SIM_SCGC5_PORTC_MASK;
+    PORTB->PCR[23] = PORT_PCR_MUX(1);
+    PORTC->PCR[3]  = PORT_PCR_MUX(1);
+    PORTC->PCR[12] = PORT_PCR_MUX(1);
+    PTB->PDDR |= (1 << 23);
+    PTC->PDDR |= (1 << 3) | (1 << 12);
+}
+
+void send_byte(unsigned char data)
+{
+    int i;
+    for (i = 7; i >= 0; i--) {
+        if (data & (1 << i)) PTC->PSOR = (1 << 12);
+        else                 PTC->PCOR = (1 << 12);
+        PTC->PSOR = (1 << 3);
+        PTC->PCOR = (1 << 3);
+    }
+}
+
+void seg_refresh(void)
+{
+    static int pos = 0;
+
+    PTB->PCOR = (1 << 23);
+    send_byte(show[pos]);
+    send_byte(digit_select[pos]);
+    PTB->PSOR = (1 << 23);
+
+    pos++;
+    if (pos == 4) pos = 0;
+}
+
+void show_countdown(int sec)
+{
+    int m = sec / 60;
+    int s = sec % 60;
+    show[0] = number[m / 10];
+    show[1] = number[m % 10] & 0x7F;
+    show[2] = number[s / 10];
+    show[3] = number[s % 10];
+}
+
+void show_stopwatch(int t)
+{
+    int m = t / 600;
+    int s = (t / 10) % 60;
+    int d = t % 10;
+
+    if (m < 10) {
+        show[0] = number[m] & 0x7F;
+        show[1] = number[s / 10];
+        show[2] = number[s % 10] & 0x7F;
+        show[3] = number[d];
+    } else {
+        show[0] = number[m / 10];
+        show[1] = number[m % 10] & 0x7F;
+        show[2] = number[s / 10];
+        show[3] = number[s % 10];
+    }
+}
+
+void pit_init(void)
+{
+    SIM->SCGC6 |= SIM_SCGC6_PIT_MASK;
+    PIT->MCR = 0;
+    PIT->CHANNEL[0].LDVAL = CLOCK / 1000 - 1;
+    PIT->CHANNEL[0].TCTRL = PIT_TCTRL_TIE_MASK | PIT_TCTRL_TEN_MASK;
+    NVIC->ISER[1] = (1 << 16);
+}
+
+void PIT0_IRQHandler(void)
+{
+    static int count_100ms = 0;
+    static int count_1s = 0;
+
+    PIT->CHANNEL[0].TFLG = PIT_TFLG_TIF_MASK;
+    ms++;
+    seg_refresh();
+
+    if (sw_state == RUN) {
+        count_100ms++;
+        if (count_100ms >= 100) {
+            count_100ms = 0;
+            if (sw_time < 59999) sw_time++;
+        }
+    }
+
+    count_1s++;
+    if (count_1s >= 1000) {
+        count_1s = 0;
+        one_sec = 1;
+        if (cd_state == RUN) {
+            if (cd_time > 0) cd_time--;
+            if (cd_time == 0) cd_state = DONE;
+        }
+    }
+}
+
+void adc_init(void)
+{
+    SIM->SCGC6 |= SIM_SCGC6_ADC0_MASK;
+    ADC0->CFG1 = ADC_CFG1_ADIV(1) | ADC_CFG1_MODE(1);
+    ADC0->SC2 = 0;
+}
+
+int adc_read(void)
+{
+    ADC0->SC1[0] = ADC_SC1_ADCH(12);
+    while ((ADC0->SC1[0] & ADC_SC1_COCO_MASK) == 0) { }
+    return ADC0->R[0];
+}
+
+void uart_init(void)
+{
+    int sbr  = CLOCK / (16 * BAUD);
+    int brfa = (CLOCK * 2 / BAUD) - (sbr * 32);
+
+    SIM->SCGC4 |= SIM_SCGC4_UART0_MASK;
+    SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK;
+    PORTB->PCR[16] = PORT_PCR_MUX(3);
+    PORTB->PCR[17] = PORT_PCR_MUX(3);
+
+    UART0->BDH = (sbr >> 8) & 0x1F;
+    UART0->BDL = sbr & 0xFF;
+    UART0->C4  = brfa;
+    UART0->C2  = UART_C2_TE_MASK;
+}
+
+void print_char(char c)
+{
+    while ((UART0->S1 & UART_S1_TDRE_MASK) == 0) { }
+    UART0->D = c;
+}
+
+void print(char *text)
+{
+    while (*text != 0) {
+        print_char(*text);
+        text++;
+    }
+}
+
+void print_num(int n)
+{
+    print_char('0' + n / 10);
+    print_char('0' + n % 10);
+}
+
+void button3(void);
+
+void button1(void)
+{
+    if (mode == COUNTDOWN) {
+        mode = STOPWATCH;
+        print("Mode: STOPWATCH\r\n");
+    } else {
+        mode = COUNTDOWN;
+        print("Mode: COUNTDOWN\r\n");
+    }
+}
+
+void button2(void)
+{
+    if (mode == COUNTDOWN) {
+        if (cd_state == READY) {
+            cd_time = set_time;
+            cd_state = RUN;
+            print("Countdown: START\r\n");
+        } else if (cd_state == RUN) {
+            cd_state = PAUSE;
+            print("Countdown: PAUSE\r\n");
+        } else if (cd_state == PAUSE) {
+            cd_state = RUN;
+            print("Countdown: START\r\n");
+        } else if (cd_state == DONE) {
+            button3();
+        }
+    } else {
+        if (sw_state == RUN) {
+            sw_state = STOP;
+            print("Stopwatch: STOP\r\n");
+        } else {
+            sw_state = RUN;
+            print("Stopwatch: START\r\n");
+        }
+    }
+}
+
+void button3(void)
+{
+    if (mode == COUNTDOWN) {
+        cd_state = READY;
+        cd_time = set_time;
+        done_printed = 0;
+        buzzer(0);
+        print("Countdown: RESET\r\n");
+    } else {
+        sw_state = READY;
+        sw_time = 0;
+        print("Stopwatch: RESET\r\n");
+    }
+}
+
+void update_output(void)
+{
+    int blink = (ms / 500) % 2;
+
+    if (mode == COUNTDOWN) {
+        show_countdown(cd_time);
+
+        if (cd_state == READY) led_only(1);
+        if (cd_state == RUN) {
+            if (blink == 1) led_only(2);
+            else            led_only(0);
+        }
+        if (cd_state == PAUSE) {
+            if (blink == 1) led_only(1);
+            else            led_only(0);
+        }
+        if (cd_state == DONE) led_only(3);
+    } else {
+        show_stopwatch(sw_time);
+
+        if (sw_state == READY) led_only(1);
+        if (sw_state == RUN) {
+            if (blink == 1) led_only(2);
+            else            led_only(0);
+        }
+        if (sw_state == STOP) led_only(3);
+    }
+
+    if (cd_state == DONE) buzzer(1);
+    else                  buzzer(0);
+}
+
+int main(void)
+{
+    led_init();
+    switch_init();
+    seg_init();
+    adc_init();
+    uart_init();
+    pit_init();
+
+    print("\r\nTimer\r\n");
+
+    while (1) {
+        if (sw1_press == 1) {
+            print("[Interrupt] S1\r\n");
+            button1();
+            wait_release(SW1);
+            sw1_press = 0;
+        }
+        if (sw2_press == 1) {
+            print("[Interrupt] S2\r\n");
+            button2();
+            wait_release(SW2);
+            sw2_press = 0;
+        }
+        if (sw3_press == 1) {
+            print("[Interrupt] S3\r\n");
+            button3();
+            wait_release(SW3);
+            sw3_press = 0;
+        }
+
+        if (mode == COUNTDOWN && cd_state == READY) {
+            set_time = (adc_read() * 59 / 4096 + 1) * 60;
+            cd_time = set_time;
+        }
+
+        if (cd_state == DONE && done_printed == 0) {
+            mode = COUNTDOWN;
+            print("Countdown: TIME UP!\r\n");
+            done_printed = 1;
+        }
+
+        if (one_sec == 1) {
+            one_sec = 0;
+            print("[Timer] ");
+            if (mode == COUNTDOWN) {
+                print("Countdown ");
+                print_num(cd_time / 60);
+                print(":");
+                print_num(cd_time % 60);
+            } else {
+                print("Stopwatch ");
+                print_num(sw_time / 600);
+                print(":");
+                print_num((sw_time / 10) % 60);
+                print(".");
+                print_char('0' + sw_time % 10);
+            }
+            print("\r\n");
+        }
+
+        update_output();
+    }
+}
